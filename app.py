@@ -12,8 +12,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from ultralytics import YOLO
 
 # ====== Cấu hình ======
-MODEL_PATH = "best.pt"                 # path tới model của bạn
-TRACKER_CFG = "tracker_bytetrack.yaml" # ByteTrack config
+MODEL_PATH = "best.pt"  # path tới model của bạn
+TRACKER_CFG = "tracker_bytetrack.yaml"  # ByteTrack config
 OUTPUT_DIR = Path("outputs")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
@@ -38,8 +38,10 @@ device = "cuda:0" if torch.cuda.is_available() else "cpu"
 model = YOLO(MODEL_PATH)
 model.to(device)
 
+
 def _safe_filename(stem: str, suffix: str) -> Path:
     return OUTPUT_DIR / f"{stem}_{uuid.uuid4().hex[:8]}{suffix}"
+
 
 def _cv2_imdecode_to_bgr(data: bytes) -> np.ndarray:
     arr = np.frombuffer(data, np.uint8)
@@ -47,6 +49,7 @@ def _cv2_imdecode_to_bgr(data: bytes) -> np.ndarray:
     if img is None:
         raise ValueError("Không đọc được ảnh (định dạng không hợp lệ?)")
     return img
+
 
 @app.get("/health")
 def health():
@@ -56,6 +59,7 @@ def health():
         "torch_cuda": torch.cuda.is_available(),
         "cuda_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
     }
+
 
 # =============== ẢNH: detect (1 frame) =================
 @app.post("/track/image")
@@ -81,6 +85,7 @@ async def track_image(file: UploadFile = File(...), conf: Optional[float] = 0.25
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+
 # =============== VIDEO: track (nhiều frame) =================
 # noinspection PyTypeChecker,PyBroadException
 @app.post("/track/video")
@@ -99,6 +104,8 @@ async def track_video(file: UploadFile = File(...), conf: Optional[float] = 0.25
         raise HTTPException(status_code=400, detail=f"Lỗi lưu tệp tạm: {e}")
 
     try:
+        with open(TRACKER_CFG) as f:
+            print(f.read())
         # Ultralytics sẽ tự tạo file output trong runs/track/... Chúng ta sẽ copy ra outputs/
         results = model.track(
             source=str(temp_in),
@@ -108,7 +115,7 @@ async def track_video(file: UploadFile = File(...), conf: Optional[float] = 0.25
             device=device,
             verbose=False,
             stream=False,
-            save=True,          # rất quan trọng: ghi video đã annotate
+            save=True,  # rất quan trọng: ghi video đã annotate
             exist_ok=True
         )
 
@@ -117,20 +124,39 @@ async def track_video(file: UploadFile = File(...), conf: Optional[float] = 0.25
         res0 = results[0] if isinstance(results, list) else results
         # save_dir kiểu .../runs/track/expN
         save_dir = Path(res0.save_dir)
-        # Tìm file .mp4 trong thư mục đó
-        mp4s = list(save_dir.glob("*.mp4"))
-        if not mp4s:
-            # fallback: một số bản sẽ xuất vào 'tracks' subdir
-            mp4s = list((save_dir / "tracks").glob("*.mp4"))
+        # Tìm file .mp4/avi trong thư mục đó
+        save_dir = Path(getattr(res0, "save_dir", "runs/detect/track"))
 
-        if not mp4s:
-            raise RuntimeError("Không tìm thấy video output sau khi track.")
+        # ✅ tìm video ở nhiều vị trí khác nhau
+        videos = sorted(
+            list(save_dir.glob("*.avi")) +
+            list((save_dir / "tracks").glob("*.avi")),
+            key=lambda f: f.stat().st_mtime,
+            reverse=True
+        )
+
+        if not videos:
+            raise RuntimeError(f"Không tìm thấy video output sau khi track. Kiểm tra thư mục: {save_dir}")
+
+        src_video = videos[0]
+
+        if src_video.suffix.lower() == ".avi":
+            src_video = convert_avi_to_mp4(src_video)
 
         final_out = _safe_filename("video_tracked", ".mp4")
-        shutil.copy2(mp4s[0], final_out)
+        shutil.copy2(src_video, final_out)
 
-        return FileResponse(path=str(final_out), media_type="video/mp4", filename=final_out.name)
+        print(final_out)
+
+        return FileResponse(
+            path=str(final_out),
+            media_type="video/mp4",
+            filename=final_out.name
+        )
     except Exception as e:
+        import traceback
+        print("Video error trackbace")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Lỗi xử lý video: {e}")
     finally:
         # Dọn file input tạm
@@ -139,6 +165,7 @@ async def track_video(file: UploadFile = File(...), conf: Optional[float] = 0.25
                 temp_in.unlink()
         except Exception:
             pass
+
 
 # =============== Endpoint tiện ích: thông tin model ================
 @app.get("/model/info")
@@ -153,3 +180,32 @@ def model_info():
         })
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+import subprocess
+
+def convert_avi_to_mp4(input_path: Path) -> Path:
+    """
+    Chuyển file .avi sang .mp4 chuẩn H.264 (phát được trên web).
+    """
+    output_path = input_path.with_suffix(".mp4")
+
+    cmd = [
+        "ffmpeg",
+        "-y",  # overwrite
+        "-i", str(input_path),
+        "-c:v", "libx264",  # chuyển codec video sang H.264
+        "-preset", "fast",
+        "-pix_fmt", "yuv420p",  # chuẩn cho browser
+        "-movflags", "+faststart",  # giúp load metadata đầu video
+        str(output_path)
+    ]
+
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        print(f"✅ Đã mã hoá lại {input_path.name} → {output_path.name} (libx264)")
+    except subprocess.CalledProcessError as e:
+        print("❌ Lỗi ffmpeg:", e.stderr.decode())
+        raise RuntimeError(f"Chuyển đổi thất bại: {e}")
+
+    return output_path
